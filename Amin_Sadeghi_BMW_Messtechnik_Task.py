@@ -1,150 +1,102 @@
-import os
-import win32com.client as win32
-import openpyxl
-from openpyxl.worksheet.worksheet import Worksheet
-from datetime import datetime
 import pandas as pd
-from typing import Optional, List
 
 
-def delete_rows_with_shapes(file_path: str, sheet_name: str, temp_file_path: str) -> None:
-    """
-    Delete rows in an Excel sheet that contain shapes.
-    """
-    try:
-        excel = win32.gencache.EnsureDispatch('Excel.Application')
-        excel.Visible = False
-        workbook = excel.Workbooks.Open(file_path)
-        sheet = workbook.Sheets(sheet_name)
+class DataLoader:
+    def __init__(self, file_path):
+        self.file_path = file_path
+        self.data = None
 
-        shape_rows = set()
-        # Identify rows that contain shapes
-        for shape in sheet.Shapes:
-            top_row = shape.TopLeftCell.Row
-            bottom_row = shape.BottomRightCell.Row
-            shape_rows.update(range(top_row, bottom_row + 1))
+    def load_excel(self):
+        self.data = pd.read_excel(self.file_path)
 
-        # Delete rows that contain shapes
-        for row in sorted(shape_rows, reverse=True):
-            sheet.Rows(row).Delete()
-
-        workbook.SaveAs(temp_file_path)
-        workbook.Close(SaveChanges=False)
-        excel.Quit()
-    except Exception as e:
-        print(f"Error in delete_rows_with_shapes: {e}")
+    def save_excel(self, output_path):
+        self.data.to_excel(output_path, index=False)
 
 
-def clean_and_format_excel(file_path: str, save_path: str) -> pd.DataFrame:
-    """
-    Clean and format an Excel file:
-    - Handle merged cells.
-    - Identify 'Date of Birth' and 'ID' columns.
-    - Format date cells.
-    - Delete rows with empty IDs.
-    """
-    try:
-        wb = openpyxl.load_workbook(file_path)
-        sheet = wb.active
+class DataCleaner:
+    @staticmethod
+    def unmerge_vertical(column):
+        filled = column.ffill()
+        mask = column.notna()
+        for i in range(1, len(mask)):
+            if mask.iloc[i]:
+                filled.iloc[i] = column.iloc[i]
+            elif not mask.iloc[i - 1]:  # it was NaN before
+                filled.iloc[i] = column.iloc[i]
+        return filled
 
-        handle_merged_cells(sheet)
-        header_row = 1
-        dob_column_index, id_column_index = identify_headers(sheet, header_row)
-        rows_to_delete = format_dates_and_identify_empty_ids(sheet, dob_column_index, id_column_index)
-
-        # Delete rows with empty IDs
-        for row in sorted(rows_to_delete, reverse=True):
-            sheet.delete_rows(row)
-
-        df = convert_sheet_to_dataframe(sheet)
-        df.to_excel(save_path, index=False)
-
-        return df
-    except Exception as e:
-        print(f"Error in clean_and_format_excel: {e}")
-        return pd.DataFrame()
+    @staticmethod
+    def format_date(column, format_string='%d.%m.%Y'):
+        """Convert and format date column."""
+        return pd.to_datetime(column).dt.strftime(format_string)
 
 
-def handle_merged_cells(sheet: Worksheet) -> None:
-    """
-    Unmerge cells and fill them with the top-left value.
-    """
-    merged_ranges = list(sheet.merged_cells.ranges)
-    # Unmerge cells and fill with top-left value
-    for merged_range in merged_ranges:
-        min_col, min_row, max_col, max_row = merged_range.bounds
-        top_left_value = sheet.cell(row=min_row, column=min_col).value
-        sheet.unmerge_cells(str(merged_range))
-        for row in range(min_row, max_row + 1):
-            for col in range(min_col, max_col + 1):
-                sheet.cell(row=row, column=col).value = top_left_value
+class DataManager:
+    def __init__(self, file_path):
+        self.loader = DataLoader(file_path)
+        self.loader.load_excel()
+        self.data = self.loader.data
 
+    def clean_data(self):
+        """Apply cleaning functions to data columns."""
+        id_column = self.find_id_column()
+        birthdate_column = self.find_birth_date_column()
+        if id_column:
+            self.data[id_column] = DataCleaner.unmerge_vertical(self.data[id_column])
+        if 'Last Name' in self.data.columns:
+            self.data['Last Name'] = DataCleaner.unmerge_vertical(self.data['Last Name'])
+        if birthdate_column:
+            self.data['Date of birth'] = DataCleaner.format_date(self.data['Date of birth'])
 
-def identify_headers(sheet: Worksheet, header_row: int) -> (Optional[int], Optional[int]):
-    """
-    Identify the 'Date of Birth' and 'ID' columns based on common headers.
-    """
-    dob_column_index = None
-    id_column_index = None
-    # Identify columns based on header values
-    for col in range(1, sheet.max_column + 1):
-        header_value = str(sheet.cell(row=header_row, column=col).value).strip().lower()
-        if header_value in ['date of birth', 'dob', 'birthdate', 'birth date', 'geburtsdatum']:
-            dob_column_index = col
-        if header_value in ['id', 'identification number', 'identifier', 'identification']:
-            id_column_index = col
+    def fill_first_column(self, method='ffill'):
+        """Fill empty cells in the first column using the specified method."""
+        first_column_name = self.data.columns[0]
+        self.data[first_column_name] = self.data[first_column_name].fillna(method=method)
 
-    if dob_column_index is None:
-        raise ValueError("Date of Birth column not found")
-    if id_column_index is None:
-        raise ValueError("ID column not found")
+    def find_id_column(self):
+        """Dynamically find the column that likely represents an ID."""
+        id_variants = ['ID', 'identification number', 'Identity number']
+        for column in self.data.columns:
+            if column.lower().replace(" ", "") in (variant.lower().replace(" ", "") for variant in id_variants):
+                return column
+        return None
 
-    return dob_column_index, id_column_index
+    def find_birth_date_column(self):
+        """Dynamically find the column that likely represents a Birth date."""
+        id_variants = ['date of birth', 'Birthdate', 'BD', 'Birth date']
+        for column in self.data.columns:
+            if column.lower().replace(" ", "") in (variant.lower().replace(" ", "") for variant in id_variants):
+                return column
+        return None
 
+    def search_by_id(self, search_id):
+        """Search for a record by ID."""
+        id_column = self.find_id_column()
+        if id_column:
+            filtered_data = self.data[self.data[id_column] == search_id]
+            return filtered_data
+        return pd.DataFrame()  # Return an empty DataFrame if no suitable ID column is found
 
-def format_dates_and_identify_empty_ids(sheet: Worksheet, dob_col_idx: int, id_col_idx: int) -> List[int]:
-    """
-    Format date cells and identify rows with empty IDs.
-    """
-    rows_to_delete = []
-    # Format date cells and mark rows with empty IDs
-    for row in range(2, sheet.max_row + 1):
-        id_cell = sheet.cell(row=row, column=id_col_idx)
-        dob_cell = sheet.cell(row=row, column=dob_col_idx)
-        if not id_cell.value or str(id_cell.value).strip() == "":
-            rows_to_delete.append(row)
-        if isinstance(dob_cell.value, datetime):
-            dob_cell.value = dob_cell.value.strftime('%d.%m.%Y')
-    return rows_to_delete
+    # def display_data(self):
+    #     """Display the first 20 rows of the DataFrame."""
+    #     print(self.data.head(20))
 
-
-def convert_sheet_to_dataframe(sheet: Worksheet) -> pd.DataFrame:
-    """
-    Convert an Excel sheet to a pandas DataFrame.
-    """
-    df = pd.DataFrame(sheet.values)
-    df.columns = df.iloc[0]  # Set first row as header
-    df = df[1:]  # Remove the first row
-    return df
-
-
-def search_id_and_retrieve_rows(df: pd.DataFrame, search_id: str) -> None:
-    """
-    Search for rows matching the given ID and print them.
-    """
-    filtered_df = df[df['ID'] == search_id]
-    print(filtered_df.to_string(index=False))
+    def save_cleaned_data(self, output_path):
+        """Save cleaned data to an Excel file."""
+        self.loader.data = self.data
+        self.loader.save_excel(output_path)
 
 
 if __name__ == "__main__":
-    # Receive inputs from the user
-    original_file_path = input("Enter the path to the original Excel file: ")
-    directory = os.path.dirname(original_file_path)
-    temp_file_path = directory + '\Intermediate.xlsx'
-    cleaned_file_path = directory + '\Cleaned_sample_list.xlsx'
-    sheet_name = input("Enter the sheet name: ")
+    data_manager = DataManager('Sample_list.xlsx')
+    data_manager.clean_data()
+    data_manager.fill_first_column()
     search_id = input("Enter the ID to search for: ")
-
-    delete_rows_with_shapes(original_file_path, sheet_name, temp_file_path)
-    cleaned_df = clean_and_format_excel(temp_file_path, cleaned_file_path)
-    search_id_and_retrieve_rows(cleaned_df, search_id)
+    # found_data = data_manager.search_by_id('50Bb061cB30B461')
+    found_data = data_manager.search_by_id(search_id)
+    if not found_data.empty:
+        print(found_data.to_string(index=True))
+    else:
+        print("No data found for the given ID.")
+    # data_manager.display_data()
+    data_manager.save_cleaned_data('Cleaned_Sample_list.xlsx')
